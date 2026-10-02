@@ -19,6 +19,8 @@ NordVPN must also be installed, logged in, and available as `nordvpn` on `PATH` 
 
 ## 2. Microsoft Entra harness
 
+> **NordVPN is required.** Install the NordVPN CLI, sign in, and confirm the `nordvpn` command works before running the harness. The local FastAPI test server does not require NordVPN.
+
 Run:
 
     .venv/bin/python login1.py
