@@ -1,7 +1,10 @@
 import unittest
 
 from auth_test_core import (
-    build_target,
+    MICROSOFT_START_URL,
+    PASSWORD_SELECTOR,
+    SUBMIT_SELECTOR,
+    USERNAME_SELECTOR,
     classify_outcome,
     is_authentication_response,
     parse_nordvpn_status,
@@ -10,112 +13,65 @@ from auth_test_core import (
 )
 
 
-class TargetConfigurationTests(unittest.TestCase):
-    def test_local_target_uses_test_server_contract(self):
-        target = build_target("local", "http://127.0.0.1:9000/")
+class MicrosoftFlowTests(unittest.TestCase):
+    def test_uses_expected_microsoft_entrypoint_and_selectors(self):
+        self.assertEqual(MICROSOFT_START_URL, "https://myapps.microsoft.com/")
+        self.assertEqual(USERNAME_SELECTOR, "#i0116")
+        self.assertEqual(PASSWORD_SELECTOR, "#i0118")
+        self.assertEqual(SUBMIT_SELECTOR, "#idSIButton9")
 
-        self.assertEqual(target.start_url, "http://127.0.0.1:9000/")
-        self.assertEqual(target.username_selector, "#username")
-        self.assertEqual(target.password_selector, "#password")
-        self.assertEqual(target.submit_selector, "button[type='submit']")
-
-    def test_microsoft_target_uses_entra_contract(self):
-        target = build_target("microsoft")
-
-        self.assertEqual(target.start_url, "https://myapps.microsoft.com/")
-        self.assertEqual(target.username_selector, "#i0116")
-        self.assertEqual(target.password_selector, "#i0118")
-        self.assertEqual(target.submit_selector, "#idSIButton9")
-
-    def test_unknown_target_is_rejected(self):
-        with self.assertRaisesRegex(ValueError, "Unsupported authentication target"):
-            build_target("unknown")
-
-
-class OutcomeClassificationTests(unittest.TestCase):
-    def test_local_success_requires_success_path(self):
-        target = build_target("local")
-
-        self.assertEqual(
-            classify_outcome(target, "http://127.0.0.1:8000/login-success", ""),
-            "succeeded",
-        )
-        self.assertEqual(
-            classify_outcome(target, "http://127.0.0.1:8000/unrelated", ""),
-            "unknown",
-        )
-
-    def test_microsoft_mfa_is_not_success(self):
-        target = build_target("microsoft")
-
+    def test_mfa_is_not_success(self):
         self.assertEqual(
             classify_outcome(
-                target,
                 "https://login.microsoftonline.com/common/SAS/BeginAuth",
                 "Approve sign in request",
             ),
             "mfa_required",
         )
 
-    def test_microsoft_success_requires_known_authenticated_host(self):
-        target = build_target("microsoft")
-
+    def test_success_requires_known_authenticated_host(self):
         self.assertEqual(
-            classify_outcome(target, "https://myapps.microsoft.com/", ""),
+            classify_outcome("https://myapps.microsoft.com/", ""),
             "succeeded",
         )
         self.assertEqual(
-            classify_outcome(target, "https://example.com/redirect", ""),
+            classify_outcome("https://example.com/redirect", ""),
             "unknown",
         )
 
-    def test_microsoft_conditional_access_is_categorized(self):
-        target = build_target("microsoft")
-
+    def test_conditional_access_is_categorized(self):
         self.assertEqual(
             classify_outcome(
-                target,
                 "https://login.microsoftonline.com/common/login",
                 "AADSTS53003: Access has been blocked by Conditional Access policies.",
             ),
             "conditional_access",
         )
 
-
-class AuthenticationResponseTests(unittest.TestCase):
-    def test_local_only_matches_login_post(self):
-        target = build_target("local", "http://127.0.0.1:8000/")
-
+    def test_matches_only_known_authentication_navigation_posts(self):
         self.assertTrue(
             is_authentication_response(
-                target,
-                "POST",
-                "http://127.0.0.1:8000/login",
-            )
-        )
-        self.assertFalse(
-            is_authentication_response(
-                target,
-                "GET",
-                "http://127.0.0.1:8000/login-success",
-            )
-        )
-
-    def test_microsoft_matches_process_auth_post(self):
-        target = build_target("microsoft")
-
-        self.assertTrue(
-            is_authentication_response(
-                target,
                 "POST",
                 "https://login.microsoftonline.com/common/SAS/ProcessAuth",
             )
         )
         self.assertFalse(
             is_authentication_response(
-                target,
                 "GET",
                 "https://login.microsoftonline.com/common/SAS/ProcessAuth",
+            )
+        )
+        self.assertFalse(
+            is_authentication_response(
+                "POST",
+                "https://login.microsoftonline.com/common/telemetry",
+            )
+        )
+        self.assertFalse(
+            is_authentication_response(
+                "POST",
+                "https://login.microsoftonline.com/common/login",
+                is_navigation_request=False,
             )
         )
 
@@ -128,7 +84,6 @@ IP: 203.0.113.8
 Country: United States
 City: Dallas
 """
-
         self.assertEqual(
             parse_nordvpn_status(status),
             {"country": "United States", "city": "Dallas"},

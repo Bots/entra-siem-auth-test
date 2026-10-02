@@ -88,10 +88,10 @@ Otherwise a client could spoof X-Forwarded-For.
 
 import json
 import os
-import secrets
 import threading
 import time
 import uuid
+from collections import OrderedDict
 
 from datetime import datetime, timezone
 from pathlib import Path
@@ -125,18 +125,68 @@ TRUST_PROXY_HEADERS = (
 )
 
 
-# Secret used by Starlette's session middleware.
-#
-# For testing, a random secret is generated at startup unless you provide:
-#
-#     SESSION_SECRET=<something-long-and-random>
-#
-# If you restart the application with a new secret, existing session cookies
-# will no longer be valid.
-SESSION_SECRET = os.getenv(
-    "SESSION_SECRET",
-    secrets.token_urlsafe(48),
-)
+def load_server_config(environ):
+    """Load required credentials with loopback-safe defaults."""
+
+    def required(name):
+        value = environ.get(name, "").strip()
+        if not value:
+            raise ValueError(f"{name} must be set")
+        return value
+
+    session_secret = required("SESSION_SECRET")
+
+    username_value = environ.get("TEST_USERNAME", "").strip()
+    raw_users = environ.get("TEST_USERS_JSON", "").strip()
+    if not raw_users and username_value.startswith("["):
+        raw_users = username_value
+    if raw_users:
+        try:
+            entries = json.loads(raw_users)
+            if not isinstance(entries, list):
+                raise TypeError
+            credentials = []
+            for entry in entries:
+                username = entry["username"]
+                password = entry["password"]
+                if not isinstance(username, str) or not isinstance(password, str):
+                    raise TypeError
+                credentials.append((username.strip(), password))
+        except (KeyError, TypeError, json.JSONDecodeError) as error:
+            raise ValueError(
+                "TEST_USERS_JSON must be a JSON array of username/password objects"
+            ) from error
+
+        if not credentials or any(not username or not password for username, password in credentials):
+            raise ValueError("TEST_USERS_JSON contains an empty username or password")
+        if len({username.lower() for username, _ in credentials}) != len(credentials):
+            raise ValueError("TEST_USERS_JSON contains duplicate usernames")
+    else:
+        credentials = [(required("TEST_USERNAME"), required("TEST_PASSWORD"))]
+
+    if len(session_secret) < 32:
+        raise ValueError("SESSION_SECRET must contain at least 32 characters")
+    if session_secret.lower().startswith("replace-"):
+        raise ValueError("SESSION_SECRET must not use the example placeholder")
+
+    host = environ.get("AUTH_HOST", "127.0.0.1").strip()
+    https_only = environ.get("SESSION_HTTPS_ONLY", "false").lower() == "true"
+    if host not in {"127.0.0.1", "localhost", "::1"} and not https_only:
+        raise ValueError(
+            "SESSION_HTTPS_ONLY=true is required when AUTH_HOST is not loopback"
+        )
+
+    config = {
+        "session_secret": session_secret,
+        "host": host,
+        "port": int(environ.get("AUTH_PORT", "8000")),
+        "https_only": https_only,
+    }
+    return config, credentials
+
+
+CONFIG, startup_credentials = load_server_config(os.environ)
+SESSION_SECRET = CONFIG["session_secret"]
 
 
 # ============================================================================
@@ -155,12 +205,16 @@ pwd_context = CryptContext(
 # ============================================================================
 
 """
-For convenience, this server supports one default test account.
+Configure either one test account or a JSON array of accounts.
 
 Set these before starting the server:
 
     export TEST_USERNAME='test@example.com'
     export TEST_PASSWORD='CorrectHorseBatteryStaple'
+    export SESSION_SECRET='replace-with-a-long-random-value'
+
+For multiple accounts, set TEST_USERS_JSON instead of TEST_USERNAME and
+TEST_PASSWORD. See README.md for the JSON format.
 
 The plaintext password exists only in process memory while the application
 starts.
@@ -169,31 +223,20 @@ The application immediately converts it to an Argon2 hash.
 
 The password itself is NEVER logged.
 
-For production-like testing, you could replace this dictionary with a
-database.
 """
-
-DEFAULT_USERNAME = os.getenv(
-    "TEST_USERNAME",
-    "test@example.com",
-)
-
-DEFAULT_PASSWORD = os.getenv(
-    "TEST_PASSWORD",
-    "ChangeMeBeforeTesting123!",
-)
-
 
 # Hash immediately at startup.
 TEST_USERS = {
-    DEFAULT_USERNAME.lower(): pwd_context.hash(
-        DEFAULT_PASSWORD
-    )
+    username.lower(): pwd_context.hash(password)
+    for username, password in startup_credentials
 }
 
 
 # Drop the module-level plaintext reference.
-DEFAULT_PASSWORD = None
+startup_credentials = None
+os.environ.pop("TEST_USERNAME", None)
+os.environ.pop("TEST_PASSWORD", None)
+os.environ.pop("TEST_USERS_JSON", None)
 
 
 # ============================================================================
@@ -216,7 +259,7 @@ app.add_middleware(
     secret_key=SESSION_SECRET,
     session_cookie="siem_test_session",
     same_site="lax",
-    https_only=False,
+    https_only=CONFIG["https_only"],
 )
 
 
@@ -564,9 +607,10 @@ FAILED_PAGE = """
 class AttemptRateLimiter:
     """Allow at most one authentication attempt per key and interval."""
 
-    def __init__(self, minimum_interval_seconds=1.0):
+    def __init__(self, minimum_interval_seconds=1.0, max_keys=10000):
         self.minimum_interval_seconds = minimum_interval_seconds
-        self._last_attempt = {}
+        self.max_keys = max_keys
+        self._last_attempt = OrderedDict()
         self._lock = threading.Lock()
 
     def allow(self, key, now=None):
@@ -575,6 +619,14 @@ class AttemptRateLimiter:
         current_time = time.monotonic() if now is None else now
 
         with self._lock:
+            while self._last_attempt:
+                _, oldest_time = next(iter(self._last_attempt.items()))
+
+                if current_time - oldest_time < self.minimum_interval_seconds:
+                    break
+
+                self._last_attempt.popitem(last=False)
+
             previous_time = self._last_attempt.get(key)
 
             if (
@@ -583,7 +635,12 @@ class AttemptRateLimiter:
             ):
                 return False
 
+            self._last_attempt.pop(key, None)
             self._last_attempt[key] = current_time
+
+            while len(self._last_attempt) > self.max_keys:
+                self._last_attempt.popitem(last=False)
+
             return True
 
 
@@ -820,19 +877,6 @@ async def login(
     )
 
     if not attempt_rate_limiter.allow(source_ip):
-        log_auth_event(
-            {
-                "timestamp": timestamp,
-                "username": username,
-                "source_ip": source_ip,
-                "user_agent": user_agent,
-                "session_id": session_id,
-                "request_id": request_id,
-                "http_status": 429,
-                "result": "rate_limited",
-            }
-        )
-
         return HTMLResponse(
             "Too many authentication attempts. Retry in one second.",
             status_code=429,
@@ -962,11 +1006,11 @@ if __name__ == "__main__":
     uvicorn.run(
         "auth_test_server:app",
 
-        # Listen on every interface so the server can be reached externally
-        # when firewall/router/reverse-proxy configuration allows it.
-        host="0.0.0.0",
+        # Loopback is the safe default. A remote bind requires an HTTPS-only
+        # session cookie and an explicit AUTH_HOST setting.
+        host=CONFIG["host"],
 
-        port=8000,
+        port=CONFIG["port"],
 
         # Disable reload for the actual test so restarting the application
         # does not invalidate session state halfway through the sequence.
