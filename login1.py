@@ -6,21 +6,38 @@ import json
 import re
 import subprocess
 import time
-import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 from auth_test_core import (
-    build_target,
+    MICROSOFT_START_URL,
+    PASSWORD_SELECTOR,
+    SUBMIT_SELECTOR,
+    USERNAME_SELECTOR,
     classify_outcome,
     is_authentication_response,
+    parse_nordvpn_status,
+    public_ip_changed,
+    vpn_location_matches,
 )
 
 
 LOG_FILE = Path("entra_auth_test_results.csv")
-TARGET = build_target("microsoft")
+LOG_FIELDS = (
+    "timestamp",
+    "username",
+    "attempt",
+    "user_agent",
+    "public_source_ip",
+    "nordvpn_location",
+    "http_result_status",
+    "microsoft_result_code",
+    "correlation_id",
+    "request_id",
+    "result",
+)
 
 # Attempts 1-9 are intentionally failed.
 # Three attempts use different countries.
@@ -104,15 +121,9 @@ def utc_timestamp():
     return datetime.now(timezone.utc).isoformat()
 
 
-def run_nordvpn(*args):
-    """
-    Run NordVPN without logging stdout/stderr.
+def run_nordvpn(*args, timeout=90):
+    """Run NordVPN without exposing command output."""
 
-    NordVPN CLI syntax used here is compatible with commands such as:
-        nordvpn c Dallas
-        nordvpn c Canada
-        nordvpn status
-    """
     try:
         result = subprocess.run(
             ["nordvpn", *args],
@@ -120,44 +131,50 @@ def run_nordvpn(*args):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=90,
+            timeout=timeout,
             check=False,
         )
-        return result.returncode == 0
+        return result.stdout if result.returncode == 0 else None
     except Exception:
-        return False
+        return None
 
 
-def rotate_vpn(location):
+def rotate_vpn(page, location, previous_ip):
+    """Connect and verify both the requested location and a new public IP."""
+
     print(f"\nConnecting NordVPN to: {location}")
 
-    if not run_nordvpn("c", location):
-        raise RuntimeError(
-            f"NordVPN could not connect to requested location: {location}"
-        )
+    if run_nordvpn("c", location) is None:
+        raise RuntimeError("NordVPN connection command failed")
 
-    # Give the tunnel/routes a moment to settle.
-    time.sleep(4)
+    for check_number in range(5):
+        status_output = run_nordvpn("status", timeout=10)
+
+        if status_output is not None:
+            actual_location = parse_nordvpn_status(status_output)
+
+            if vpn_location_matches(location, actual_location):
+                current_ip = get_browser_public_ip(page)
+
+                if public_ip_changed(previous_ip, current_ip):
+                    return current_ip
+
+        if check_number < 4:
+            time.sleep(2)
+
+    raise RuntimeError("NordVPN location or public IP could not be verified")
 
 
-def get_public_ip():
-    """
-    Fetch only the current public IP.
+def get_browser_public_ip(page):
+    """Fetch the public IP through the preserved browser context."""
 
-    No authentication information is sent to this endpoint.
-    """
     try:
-        request = urllib.request.Request(
+        page.goto(
             "https://api.ipify.org?format=json",
-            headers={
-                "User-Agent": "entra-siem-auth-test/1.0",
-                "Accept": "application/json",
-            },
+            wait_until="domcontentloaded",
+            timeout=15000,
         )
-
-        with urllib.request.urlopen(request, timeout=15) as response:
-            data = json.loads(response.read().decode("utf-8"))
-
+        data = json.loads(page.locator("body").inner_text(timeout=3000))
         return data.get("ip", "unknown")
     except Exception:
         return "unknown"
@@ -170,19 +187,7 @@ def initialize_log():
     with LOG_FILE.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(
             handle,
-            fieldnames=[
-                "timestamp",
-                "username",
-                "attempt",
-                "user_agent",
-                "public_source_ip",
-                "nordvpn_location",
-                "http_result_status",
-                "microsoft_result_code",
-                "correlation_id",
-                "request_id",
-                "result",
-            ],
+            fieldnames=LOG_FIELDS,
         )
         writer.writeheader()
 
@@ -192,38 +197,12 @@ def write_log(record):
     Only explicitly approved non-sensitive fields can reach disk.
     Passwords are never accepted by this function.
     """
-    allowed = {
-        "timestamp",
-        "username",
-        "attempt",
-        "user_agent",
-        "public_source_ip",
-        "nordvpn_location",
-        "http_result_status",
-        "microsoft_result_code",
-        "correlation_id",
-        "request_id",
-        "result",
-    }
-
-    record = {key: record.get(key, "") for key in allowed}
+    record = {key: record.get(key, "") for key in LOG_FIELDS}
 
     with LOG_FILE.open("a", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(
             handle,
-            fieldnames=[
-                "timestamp",
-                "username",
-                "attempt",
-                "user_agent",
-                "public_source_ip",
-                "nordvpn_location",
-                "http_result_status",
-                "microsoft_result_code",
-                "correlation_id",
-                "request_id",
-                "result",
-            ],
+            fieldnames=LOG_FIELDS,
         )
         writer.writerow(record)
 
@@ -263,19 +242,16 @@ def click_if_visible(locator, timeout=1500):
     return False
 
 
-def prepare_username_page(page, target):
+def prepare_username_page(page):
     """
     Get Microsoft back to an account/username selection state while
     preserving the existing browser context, cookies and storage.
     """
     page.goto(
-        target.start_url,
+        MICROSOFT_START_URL,
         wait_until="domcontentloaded",
         timeout=60000,
     )
-
-    if target.name == "local":
-        return
 
     # Microsoft may show the account picker when session state exists.
     account_options = [
@@ -290,7 +266,7 @@ def prepare_username_page(page, target):
 
     # If Microsoft remembered a username and is already asking for its
     # password, try the standard Back control to change account.
-    email_box = page.locator("#i0116")
+    email_box = page.locator(USERNAME_SELECTOR)
 
     try:
         if not email_box.is_visible(timeout=2000):
@@ -305,35 +281,32 @@ def prepare_username_page(page, target):
             break
 
 
-def enter_username(page, target, username):
-    email = page.locator(target.username_selector)
+def enter_username(page, username):
+    email = page.locator(USERNAME_SELECTOR)
     email.wait_for(state="visible", timeout=20000)
 
     email.fill(username)
 
-    if target.name == "local":
-        return
-
-    submit = page.locator(target.submit_selector)
+    submit = page.locator(SUBMIT_SELECTOR)
     submit.click(timeout=10000)
 
-    password = page.locator(target.password_selector)
+    password = page.locator(PASSWORD_SELECTOR)
     password.wait_for(state="visible", timeout=20000)
 
 
-def enter_password(page, target, password):
-    password_box = page.locator(target.password_selector)
+def enter_password(page, password):
+    password_box = page.locator(PASSWORD_SELECTOR)
 
     # Password exists only in memory long enough to fill the browser form.
     password_box.fill(password)
 
-    submit = page.locator(target.submit_selector)
+    submit = page.locator(SUBMIT_SELECTOR)
 
     with page.expect_response(
         lambda response: is_authentication_response(
-            target,
             response.request.method,
             response.url,
+            response.request.is_navigation_request(),
         ),
         timeout=20000,
     ) as response_info:
@@ -388,27 +361,13 @@ def update_from_headers(metadata, headers):
                 break
 
 
-def determine_result(page, target):
-    """
-    Detect common Microsoft outcomes without dumping page content.
-
-    Attempts 1-9 are expected to fail.
-    Attempt 10 is expected to succeed.
-    """
-    return classify_outcome(
-        target,
-        page.url,
-        safe_body_text(page),
-    )
-
-
-def wait_for_auth_result(page, target):
+def wait_for_auth_result(page):
     deadline = time.time() + 20
 
     result = "unknown"
 
     while time.time() < deadline:
-        result = determine_result(page, target)
+        result = classify_outcome(page.url, safe_body_text(page))
 
         if result != "unknown":
             return result
@@ -446,6 +405,15 @@ def main():
         cdp = context.new_cdp_session(page)
 
         try:
+            previous_public_ip = get_browser_public_ip(page)
+
+            if previous_public_ip == "unknown":
+                print("Unable to establish the initial public source IP.")
+                return 1
+
+            completed_attempts = 0
+            last_result = None
+
             for index in range(10):
                 attempt = index + 1
                 location = VPN_LOCATIONS[index]
@@ -460,7 +428,12 @@ def main():
                 # Rotate the public IP while leaving the browser process,
                 # browser context, cookies and storage intact.
                 try:
-                    rotate_vpn(location)
+                    public_ip = rotate_vpn(
+                        page,
+                        location,
+                        previous_public_ip,
+                    )
+                    previous_public_ip = public_ip
                 except Exception:
                     print(
                         "VPN connection failed. Authentication attempt "
@@ -483,8 +456,6 @@ def main():
                     )
                     break
 
-                public_ip = get_public_ip()
-
                 print(f"Public source IP: {public_ip}")
 
                 # Override the UA on the existing Chromium target instead
@@ -503,6 +474,10 @@ def main():
                     },
                 )
 
+                if page.evaluate("navigator.userAgent") != user_agent:
+                    print("User-Agent verification failed; stopping test.")
+                    break
+
                 username = input(
                     f"Username for attempt {attempt}: "
                 ).strip()
@@ -516,30 +491,35 @@ def main():
                 microsoft_code = None
                 page_correlation_id = None
                 page_request_id = None
+                current_metadata = {
+                    "http_status": None,
+                    "request_id": None,
+                    "correlation_id": None,
+                }
 
                 try:
-                    prepare_username_page(page, TARGET)
-                    enter_username(page, TARGET, username)
-                    auth_response = enter_password(
-                        page,
-                        TARGET,
-                        password,
-                    )
+                    prepare_username_page(page)
+                    enter_username(page, username)
+                    auth_response = enter_password(page, password)
 
-                    current_metadata = {
-                        "http_status": auth_response.status,
-                        "request_id": None,
-                        "correlation_id": None,
-                    }
+                    current_metadata["http_status"] = auth_response.status
                     update_from_headers(
                         current_metadata,
                         auth_response.headers,
                     )
 
+                    submitted_user_agent = auth_response.request.headers.get(
+                        "user-agent",
+                        "",
+                    )
+
+                    if submitted_user_agent != user_agent:
+                        result = "user_agent_mismatch"
+                    else:
+                        result = wait_for_auth_result(page)
+
                     # Remove the Python reference immediately after use.
                     password = None
-
-                    result = wait_for_auth_result(page, TARGET)
 
                     (
                         microsoft_code,
@@ -550,23 +530,11 @@ def main():
                 except PlaywrightTimeoutError:
                     # Do not print Playwright exception messages because
                     # browser automation errors may contain page details.
-                    password = None
                     result = "timeout"
-                    current_metadata = {
-                        "http_status": None,
-                        "request_id": None,
-                        "correlation_id": None,
-                    }
 
                 except Exception:
                     # Never serialize exception messages or traceback data.
-                    password = None
                     result = "browser_error"
-                    current_metadata = {
-                        "http_status": None,
-                        "request_id": None,
-                        "correlation_id": None,
-                    }
 
                 finally:
                     # Best-effort overwrite/removal of the Python reference.
@@ -607,6 +575,8 @@ def main():
                 )
 
                 print(f"Result: {result}")
+                completed_attempts = attempt
+                last_result = result
 
                 if microsoft_code:
                     print(f"Microsoft result code: {microsoft_code}")
@@ -617,12 +587,26 @@ def main():
                 if request_id:
                     print(f"Request ID: {request_id}")
 
+                expected_result = "failed" if attempt < 10 else "succeeded"
+
+                if result != expected_result:
+                    print(
+                        f"Expected {expected_result}; stopping before the "
+                        "sequence can be marked complete."
+                    )
+                    break
+
                 if attempt < 10:
                     input(
                         "Press Enter when ready for the next attempt..."
                     )
 
-            print(f"\nTest complete. Metadata saved to {LOG_FILE}")
+            if completed_attempts == 10 and last_result == "succeeded":
+                print(f"\nTest complete. Metadata saved to {LOG_FILE}")
+                return 0
+
+            print(f"\nTest stopped early. Partial metadata saved to {LOG_FILE}")
+            return 1
 
         finally:
             try:
@@ -637,4 +621,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
