@@ -88,6 +88,7 @@ Otherwise a client could spoof X-Forwarded-For.
 
 import json
 import os
+import secrets
 import threading
 import time
 import uuid
@@ -134,7 +135,14 @@ def load_server_config(environ):
             raise ValueError(f"{name} must be set")
         return value
 
-    session_secret = required("SESSION_SECRET")
+    host = environ.get("AUTH_HOST", "127.0.0.1").strip()
+    is_loopback = host in {"127.0.0.1", "localhost", "::1"}
+
+    session_secret = environ.get("SESSION_SECRET", "").strip()
+    if not session_secret:
+        if not is_loopback:
+            raise ValueError("SESSION_SECRET must be set for a non-loopback bind")
+        session_secret = secrets.token_urlsafe(48)
 
     username_value = environ.get("TEST_USERNAME", "").strip()
     raw_users = environ.get("TEST_USERS_JSON", "").strip()
@@ -157,21 +165,26 @@ def load_server_config(environ):
                 "TEST_USERS_JSON must be a JSON array of username/password objects"
             ) from error
 
-        if not credentials or any(not username or not password for username, password in credentials):
+        if not credentials or any(
+            not username or not password for username, password in credentials
+        ):
             raise ValueError("TEST_USERS_JSON contains an empty username or password")
         if len({username.lower() for username, _ in credentials}) != len(credentials):
             raise ValueError("TEST_USERS_JSON contains duplicate usernames")
-    else:
+    elif username_value or environ.get("TEST_PASSWORD", "").strip():
         credentials = [(required("TEST_USERNAME"), required("TEST_PASSWORD"))]
+    elif is_loopback:
+        credentials = [("test@example.com", "LocalTestOnly123!")]
+    else:
+        raise ValueError("TEST_USERNAME and TEST_PASSWORD must be set")
 
     if len(session_secret) < 32:
         raise ValueError("SESSION_SECRET must contain at least 32 characters")
     if session_secret.lower().startswith("replace-"):
         raise ValueError("SESSION_SECRET must not use the example placeholder")
 
-    host = environ.get("AUTH_HOST", "127.0.0.1").strip()
     https_only = environ.get("SESSION_HTTPS_ONLY", "false").lower() == "true"
-    if host not in {"127.0.0.1", "localhost", "::1"} and not https_only:
+    if not is_loopback and not https_only:
         raise ValueError(
             "SESSION_HTTPS_ONLY=true is required when AUTH_HOST is not loopback"
         )
@@ -205,9 +218,10 @@ pwd_context = CryptContext(
 # ============================================================================
 
 """
-Configure either one test account or a JSON array of accounts.
+Loopback mode has one local-only default account. Configure either one custom
+test account or a JSON array of accounts to replace it.
 
-Set these before starting the server:
+Optional custom account settings:
 
     export TEST_USERNAME='test@example.com'
     export TEST_PASSWORD='CorrectHorseBatteryStaple'

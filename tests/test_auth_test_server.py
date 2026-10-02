@@ -16,6 +16,13 @@ from auth_test_server import AttemptRateLimiter
 
 
 class ServerConfigTests(unittest.TestCase):
+    def test_loopback_server_runs_with_safe_local_defaults(self):
+        config, credentials = auth_test_server.load_server_config({})
+
+        self.assertEqual(config["host"], "127.0.0.1")
+        self.assertGreaterEqual(len(config["session_secret"]), 32)
+        self.assertEqual(credentials[0][0], "test@example.com")
+
     def test_supports_nine_test_users(self):
         users = [
             {
@@ -35,12 +42,7 @@ class ServerConfigTests(unittest.TestCase):
         self.assertEqual(credentials[0], (users[0]["username"], users[0]["password"]))
         self.assertNotIn("password", config)
 
-    def test_requires_credentials_and_a_strong_session_secret(self):
-        with self.assertRaisesRegex(ValueError, "TEST_USERNAME"):
-            auth_test_server.load_server_config(
-                {"SESSION_SECRET": "synthetic-session-secret-long-enough-for-tests"}
-            )
-
+    def test_rejects_weak_session_secret(self):
         with self.assertRaisesRegex(ValueError, "at least 32"):
             auth_test_server.load_server_config(
                 {
@@ -58,6 +60,17 @@ class ServerConfigTests(unittest.TestCase):
                     "TEST_PASSWORD": TEST_PASSWORD,
                     "SESSION_SECRET": "synthetic-session-secret-long-enough-for-tests",
                     "AUTH_HOST": "0.0.0.0",
+                }
+            )
+
+    def test_remote_bind_requires_explicit_session_secret(self):
+        with self.assertRaisesRegex(ValueError, "SESSION_SECRET"):
+            auth_test_server.load_server_config(
+                {
+                    "TEST_USERNAME": TEST_USERNAME,
+                    "TEST_PASSWORD": TEST_PASSWORD,
+                    "AUTH_HOST": "0.0.0.0",
+                    "SESSION_HTTPS_ONLY": "true",
                 }
             )
 

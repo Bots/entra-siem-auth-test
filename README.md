@@ -69,9 +69,20 @@ Microsoft may issue a different request or correlation ID for every attempt; the
 
 The server is independent of the Microsoft harness. It provides a basic HTML login form, Argon2 password checking, a stable browser-session ID, a new request ID for every submitted login, JSONL event logging, and a limit of one authentication attempt per source IP per second.
 
+For a quick local test, no environment variables are required:
+
+    .venv/bin/python auth_test_server.py
+
+It binds only to `127.0.0.1:8000`, generates an in-memory session secret, and uses:
+
+- Username: `test@example.com`
+- Password: `LocalTestOnly123!`
+
+Set explicit credentials for anything beyond this loopback-only smoke test.
+
 ### Single test user
 
-Set these variables in the shell:
+To replace the local defaults, set these variables in the shell:
 
     export TEST_USERNAME='test@example.invalid'
     export TEST_PASSWORD='replace-with-a-test-only-password'
@@ -112,7 +123,7 @@ Events are appended to `auth_test_events.jsonl` unless `AUTH_LOG_FILE` is set.
 - `SESSION_HTTPS_ONLY`: must be `true` for a non-loopback bind.
 - `TRUST_PROXY_HEADERS`: use `X-Forwarded-For` only behind a trusted reverse proxy that blocks direct client access.
 
-The server refuses weak session secrets shorter than 32 characters and rejects the placeholder from `.env.example`.
+For loopback use, a missing session secret is generated in memory at startup. A supplied secret must contain at least 32 characters and cannot be the `.env.example` placeholder. Non-loopback binds require an explicit session secret and HTTPS-only cookies.
 
 ## 4. Checks
 
