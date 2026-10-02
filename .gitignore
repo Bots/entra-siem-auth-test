@@ -1,0 +1,13 @@
+.venv/
+.serena/
+__pycache__/
+*.py[cod]
+*.csv
+*.jsonl
+*.log
+.env
+.env.*
+!.env.example
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
